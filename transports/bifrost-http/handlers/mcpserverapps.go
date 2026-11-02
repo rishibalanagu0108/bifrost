@@ -219,7 +219,9 @@ func (h *MCPServerHandler) resolveToolAlias(ctx context.Context, bare string) (g
 	}
 	var visible map[string]struct{}
 	if requestNarrowed(ctx) {
-		tools := h.toolManager.GetAvailableMCPTools(withCallerCapabilities(ctx))
+		// WithAllTools keeps the caller's include lists but not the app-only rule, so an app-only tool the
+		// caller can reach is refused as app-only, as on /mcp, rather than as unknown.
+		tools := h.toolManager.GetAvailableMCPTools(coremcp.WithAllTools(withCallerCapabilities(ctx)))
 		visible = make(map[string]struct{}, len(tools))
 		for _, tool := range tools {
 			if tool.Function != nil {
