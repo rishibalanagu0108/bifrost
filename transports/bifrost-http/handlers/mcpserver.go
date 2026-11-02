@@ -94,10 +94,10 @@ type MCPServerHandler struct {
 	mcpServer *server.MCPServer
 	// transport speaks the Streamable HTTP rules of every protocol revision on top of mcpServer.
 	transport   *server.StreamableHTTPServer
-	served      MCPResourcesAndPromptsServer // nil serves tools only
-	syncMu      sync.Mutex                   // one sync at a time, so tools, appTools and resources stay in step
-	appTools    atomic.Pointer[gatewayAppTools]
-	uiResources atomic.Bool // the server installed namespaced ui:// resources or templates
+	served      MCPResourcesAndPromptsServer     // nil serves tools only
+	syncMu      sync.Mutex                       // one sync at a time, so tools, toolIndex and resources stay in step
+	toolIndex   atomic.Pointer[gatewayToolIndex] // MCP Apps facts and server-given names of the installed tools
+	uiResources atomic.Bool                      // the server installed namespaced ui:// resources or templates
 	// tokenValidator, when set, may refuse a verified Bifrost-issued token.
 	tokenValidator MCPTokenValidator
 }
@@ -351,8 +351,8 @@ func (h *MCPServerHandler) SyncMCPServer(ctx context.Context) error {
 	defer h.syncMu.Unlock()
 	// App-only tools are installed too; who may see and call them is decided per request.
 	availableTools := h.toolManager.GetAvailableMCPTools(coremcp.WithAllTools(ctx))
-	tools, apps := h.serverTools(availableTools)
-	h.appTools.Store(apps)
+	tools, index := h.serverTools(availableTools)
+	h.toolIndex.Store(index)
 	h.mcpServer.SetTools(tools...)
 	logger.Debug("Synced MCP server with %d tools", len(availableTools))
 	if h.served != nil {
@@ -398,6 +398,7 @@ func (h *MCPServerHandler) setInstructions(ctx context.Context, field *string) {
 func (h *MCPServerHandler) buildServer() *server.MCPServer {
 	hooks := &server.Hooks{}
 	hooks.AddAfterListTools(h.narrowListedTools)
+	hooks.AddBeforeCallTool(h.resolveCallToolName)
 	hooks.AddAfterInitialize(h.forwardServerInstructions)
 	hooks.AddAfterDiscover(h.forwardDiscoverInstructions)
 
@@ -418,10 +419,10 @@ func (h *MCPServerHandler) buildServer() *server.MCPServer {
 // serverTools turns every available tool into a server tool. A tool's handler reads nothing about
 // the caller: what a request may see and call rides on its context, and both the tool filter and
 // the executor read it from there.
-// It also returns what it learned about MCP Apps tools, nil when there are none.
-func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]server.ServerTool, *gatewayAppTools) {
+// It also returns the index of their MCP Apps facts and server-given names, nil when there is none.
+func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]server.ServerTool, *gatewayToolIndex) {
 	tools := make([]server.ServerTool, 0, len(availableTools))
-	var apps *gatewayAppTools
+	var index *gatewayToolIndex
 	for _, tool := range availableTools {
 		// Only process function tools (skip custom tools)
 		if tool.Function == nil {
@@ -495,10 +496,10 @@ func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]ser
 		}
 		var aggregateMeta *mcp.Meta
 		serverTool.Meta, aggregateMeta = toolMeta(tool)
-		apps = withAppTools(apps, tool, aggregateMeta)
+		index = indexTool(index, tool, aggregateMeta)
 		tools = append(tools, server.ServerTool{Tool: serverTool, Handler: handler})
 	}
-	return tools, apps
+	return h.refusalTools(index, tools), index
 }
 
 // gatewayToolResult is what /mcp answers for a tool message: the upstream's own result while no plugin
@@ -591,14 +592,21 @@ func derefOr(value *string, fallback string) string {
 // narrowListedTools narrows a tools/list answer to what the request's context permits: the include
 // lists the caller sent (x-bf-mcp-include-clients, x-bf-mcp-include-tools) and the tool list the
 // request was admitted with, which admit stamps on the same key; then the MCP Apps rules
-// (applyAppTools). It edits the page mcp-go built, so the server must not paginate tools/list.
+// (applyAppTools). The hidden refusal tools for server-given names are never listed. It edits the
+// page mcp-go built, so the server must not paginate tools/list.
 func (h *MCPServerHandler) narrowListedTools(ctx context.Context, _ any, _ *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
-	apps := h.appTools.Load()
-	if result == nil || (apps == nil && !requestNarrowed(ctx)) {
+	if result == nil {
+		return
+	}
+	index, narrowed := h.toolIndex.Load(), requestNarrowed(ctx)
+	if !narrowed {
+		dropRefusalTools(index, result) // a narrowed list keeps only Bifrost's own names
+	}
+	if !narrowed && !index.hasAppTools() {
 		return
 	}
 	callerCtx := withCallerCapabilities(ctx)
-	if requestNarrowed(ctx) {
+	if narrowed {
 		result.Tools = keepAllowed(result.Tools, func(t mcp.Tool) string { return t.Name }, h.toolManager.GetAvailableMCPTools(callerCtx), func(t schemas.ChatTool) string {
 			if t.Function == nil {
 				return ""
@@ -606,7 +614,7 @@ func (h *MCPServerHandler) narrowListedTools(ctx context.Context, _ any, _ *mcp.
 			return t.Function.Name
 		})
 	}
-	applyAppTools(callerCtx, apps, result)
+	applyAppTools(callerCtx, index, result)
 }
 
 // Admission
