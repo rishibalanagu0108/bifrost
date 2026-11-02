@@ -172,7 +172,7 @@ func (m *MCPManager) acquireClientConn(ctx *schemas.BifrostContext, state *schem
 		initRequest := mcp.InitializeRequest{
 			Params: mcp.InitializeParams{
 				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-				Capabilities:    mcp.ClientCapabilities{},
+				Capabilities:    bifrostClientCapabilities,
 				ClientInfo: mcp.Implementation{
 					Name:    fmt.Sprintf("Bifrost-%s-user", config.Name),
 					Version: "1.0.0",
@@ -1403,7 +1403,7 @@ func (m *MCPManager) verifyPerUserOAuthConnection(ctx context.Context, config *s
 		initRequest := mcp.InitializeRequest{
 			Params: mcp.InitializeParams{
 				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-				Capabilities:    mcp.ClientCapabilities{},
+				Capabilities:    bifrostClientCapabilities,
 				ClientInfo: mcp.Implementation{
 					Name:    fmt.Sprintf("Bifrost-%s-verify", config.Name),
 					Version: "1.0.0",
@@ -1589,7 +1589,7 @@ func (m *MCPManager) verifyHeadersConnection(ctx context.Context, config *schema
 		initRequest := mcp.InitializeRequest{
 			Params: mcp.InitializeParams{
 				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-				Capabilities:    mcp.ClientCapabilities{},
+				Capabilities:    bifrostClientCapabilities,
 				ClientInfo: mcp.Implementation{
 					Name:    fmt.Sprintf("Bifrost-%s-verify", config.Name),
 					Version: "1.0.0",
@@ -3298,7 +3298,7 @@ func (m *MCPManager) connectToMCPClientWithin(dialCtx, requestCtx context.Contex
 		extInitRequest := mcp.InitializeRequest{
 			Params: mcp.InitializeParams{
 				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-				Capabilities:    mcp.ClientCapabilities{},
+				Capabilities:    bifrostClientCapabilities,
 				ClientInfo: mcp.Implementation{
 					Name:    fmt.Sprintf("Bifrost-%s", config.Name),
 					Version: "1.0.0",
@@ -4313,7 +4313,7 @@ func (m *MCPManager) startLocalMCPServer() error {
 	initRequest := mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			Capabilities:    mcp.ClientCapabilities{},
+			Capabilities:    bifrostClientCapabilities,
 			ClientInfo: mcp.Implementation{
 				Name:    BifrostMCPClientName,
 				Version: BifrostMCPVersion,

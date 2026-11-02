@@ -150,6 +150,9 @@ func (m *MCPManager) prepareToolExecution(ctx *schemas.BifrostContext, request *
 	if err := checkToolExecutionPermitted(ctx, state, toolName, m.logger); err != nil {
 		return nil, nil, nil, err
 	}
+	if !hostsApps(ctx) && m.isAppOnlyTool(state.ExecutionConfig.ID, toolName) {
+		return nil, nil, nil, fmt.Errorf("tool '%s' is not permitted (it is only callable from an MCP App)", toolName)
+	}
 	// NeedsReauth is the one hard gate left besides Disabled: the credential
 	// is confirmed permanently dead (see connectToMCPClient's typed
 	// ErrOAuth2TokenExpired classification), so there's no point attempting
@@ -205,6 +208,8 @@ func (m *MCPManager) codeModeClientReachable(ctx *schemas.BifrostContext) bool {
 //  2. Client allow-list — request-context MCPContextKeyIncludeClients.
 //  3. Tool allow-list   — client-level ToolsToExecute (most restrictive).
 //  4. Tool narrowing    — request-context MCPContextKeyIncludeTools.
+//
+// The app-only rule is enforced in prepareToolExecution.
 //
 // A provider-injected tool (core's injectedauth marker names it) skips 2-4.
 // The operator chose it in the provider config, and the caller never saw it in the
