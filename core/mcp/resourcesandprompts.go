@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -196,7 +197,9 @@ func rebindPromptsToClientName(prompts []mcp.Prompt, clientName string) []mcp.Pr
 // reachableClients returns copies of the enabled clients ctx may reach, by name, each holding only the
 // prompts, resources and templates its allow-lists expose. A tool filter reaches a client through its
 // "<client>-*" entry or one of its tools, so a server without tools is reached by the wildcard.
+// An aggregate gateway request sees ui:// resources as ui://<client>/..., so two servers' apps never collide.
 func (m *MCPManager) reachableClients(ctx context.Context) []*schemas.MCPClientState {
+	aggregate := GatewayAggregate(ctx)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	clients := make([]*schemas.MCPClientState, 0, len(m.clientMap))
@@ -208,7 +211,13 @@ func (m *MCPManager) reachableClients(ctx context.Context) []*schemas.MCPClientS
 		stateCopy := *state
 		stateCopy.Prompts = exposed(state.Prompts, config.PromptsToExpose, func(p mcp.Prompt) string { return stripClientPrefix(p.Name, config.Name) })
 		stateCopy.Resources = exposed(state.Resources, config.ResourcesToExpose, resourceURI)
+		if aggregate {
+			stateCopy.Resources = namespaceUIResources(stateCopy.Resources, config.Name)
+		}
 		stateCopy.ResourceTemplates = exposed(state.ResourceTemplates, config.ResourcesToExpose, ResourceTemplateURI)
+		if aggregate {
+			stateCopy.ResourceTemplates = namespaceUITemplates(stateCopy.ResourceTemplates, config.Name)
+		}
 		clients = append(clients, &stateCopy)
 	}
 	sortByName(clients)
@@ -248,6 +257,58 @@ func exposed[T any](items []T, allow schemas.WhiteList, key func(T) string) []T 
 }
 
 func resourceURI(r mcp.Resource) string { return r.URI }
+
+// namespaceUIResources returns resources with ui:// URIs under clientName, copying only when one is.
+func namespaceUIResources(resources []mcp.Resource, clientName string) []mcp.Resource {
+	i := slices.IndexFunc(resources, func(r mcp.Resource) bool { return strings.HasPrefix(r.URI, "ui://") })
+	if i < 0 {
+		return resources
+	}
+	namespaced := slices.Clone(resources)
+	for j := i; j < len(namespaced); j++ {
+		namespaced[j].URI = GatewayUIResourceURI(clientName, namespaced[j].URI)
+	}
+	return namespaced
+}
+
+// namespaceUITemplates is namespaceUIResources for resource templates.
+func namespaceUITemplates(templates []mcp.ResourceTemplate, clientName string) []mcp.ResourceTemplate {
+	i := slices.IndexFunc(templates, func(t mcp.ResourceTemplate) bool { return strings.HasPrefix(ResourceTemplateURI(t), "ui://") })
+	if i < 0 {
+		return templates
+	}
+	namespaced := slices.Clone(templates)
+	for j := i; j < len(namespaced); j++ {
+		raw := ResourceTemplateURI(namespaced[j])
+		if !strings.HasPrefix(raw, "ui://") {
+			continue
+		}
+		quoted, _ := json.Marshal(GatewayUIResourceURI(clientName, raw))
+		parsed := &mcp.URITemplate{}
+		if json.Unmarshal(quoted, parsed) == nil {
+			namespaced[j].URITemplate = parsed
+		}
+	}
+	return namespaced
+}
+
+// withGatewayUIResourceURI renames the contents of a ui:// read back to the URI the caller asked for.
+func withGatewayUIResourceURI(result *mcp.ReadResourceResult, upstreamURI, gatewayURI string) {
+	for i, content := range result.Contents {
+		switch c := content.(type) {
+		case mcp.TextResourceContents:
+			if c.URI == upstreamURI {
+				c.URI = gatewayURI
+				result.Contents[i] = c
+			}
+		case mcp.BlobResourceContents:
+			if c.URI == upstreamURI {
+				c.URI = gatewayURI
+				result.Contents[i] = c
+			}
+		}
+	}
+}
 
 func sortByName(clients []*schemas.MCPClientState) {
 	slices.SortFunc(clients, func(a, b *schemas.MCPClientState) int {
@@ -344,9 +405,16 @@ func (m *MCPManager) ReadResource(ctx *schemas.BifrostContext, uri string) (*mcp
 		func(ctx context.Context, conn *client.Client, req *schemas.BifrostMCPRequest) (*mcp.ReadResourceResult, error) {
 			read := mcp.ReadResourceRequest{}
 			read.Params.URI = req.BifrostMCPReadResourceRequest.URI
+			namespaced := false
+			if GatewayAggregate(ctx) {
+				read.Params.URI, namespaced = upstreamUIResourceURI(req.ClientName, read.Params.URI)
+			}
 			result, err := conn.ReadResource(ctx, read)
 			if err == nil && result.NeedsInput() {
 				return nil, &UnservableInputError{Requests: result.InputRequests, ServerName: req.ClientName}
+			}
+			if err == nil && namespaced {
+				withGatewayUIResourceURI(result, read.Params.URI, req.BifrostMCPReadResourceRequest.URI)
 			}
 			return result, err
 		},
@@ -383,9 +451,15 @@ func (m *MCPManager) Complete(ctx *schemas.BifrostContext, params mcp.CompletePa
 				return emptyCompletion(), nil
 			}
 			complete := mcp.CompleteRequest{Params: req.BifrostMCPCompleteRequest.Params}
-			if ref, ok := complete.Params.Ref.(mcp.PromptReference); ok {
+			switch ref := complete.Params.Ref.(type) {
+			case mcp.PromptReference:
 				ref.Name = stripClientPrefix(ref.Name, req.ClientName)
 				complete.Params.Ref = ref
+			case mcp.ResourceReference:
+				if GatewayAggregate(ctx) {
+					ref.URI, _ = upstreamUIResourceURI(req.ClientName, ref.URI)
+					complete.Params.Ref = ref
+				}
 			}
 			return conn.Complete(ctx, complete)
 		},
@@ -430,7 +504,7 @@ func runOnClient[T any](m *MCPManager, ctx *schemas.BifrostContext, req *schemas
 		if err != nil {
 			return zero, err
 		}
-		upstreamCtx, _, _ := upstreamContext(callCtx, conn, false)
+		upstreamCtx, _, _ := upstreamContext(callCtx, conn, readRelayedCapabilities)
 		result, err := call(upstreamCtx, conn, preReq)
 		recoverable := err != nil && (isAuthFailure(err) || (isDeadSessionError(err) && hasProtocolSession(conn)))
 		release()
@@ -441,7 +515,7 @@ func runOnClient[T any](m *MCPManager, ctx *schemas.BifrostContext, req *schemas
 		if recovered, _ := m.toolsManager.recoverCall(recoveryCtx, req.RequestType.OTelMethodName(), state, state.ExecutionConfig, timeout, false, nil,
 			func(retryCtx context.Context, conn *client.Client) error {
 				var retryErr error
-				retryUpstreamCtx, _, _ := upstreamContext(retryCtx, conn, false)
+				retryUpstreamCtx, _, _ := upstreamContext(retryCtx, conn, readRelayedCapabilities)
 				result, retryErr = call(retryUpstreamCtx, conn, preReq)
 				return retryErr
 			}); recovered {

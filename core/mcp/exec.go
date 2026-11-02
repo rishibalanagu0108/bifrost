@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -75,11 +74,7 @@ func (m *MCPManager) executeToolWithHooks(
 	// Populate top-level ClientName from the prefixed tool name so the gate can
 	// attribute short-circuit responses without depending on prefix parsing.
 	if request.ClientName == "" {
-		if toolName := request.GetToolName(); toolName != "" {
-			if idx := strings.IndexByte(toolName, '-'); idx > 0 {
-				request.ClientName = toolName[:idx]
-			}
-		}
+		request.ClientName = ToolClientName(request.GetToolName())
 	}
 
 	resp, bErr := m.RunWithPluginPipeline(ctx, request, func(preReq *schemas.BifrostMCPRequest) (*schemas.BifrostMCPResponse, error) {
@@ -150,7 +145,7 @@ func (m *MCPManager) prepareToolExecution(ctx *schemas.BifrostContext, request *
 	if err := checkToolExecutionPermitted(ctx, state, toolName, m.logger); err != nil {
 		return nil, nil, nil, err
 	}
-	if !hostsApps(ctx) && m.isAppOnlyTool(state.ExecutionConfig.ID, toolName) {
+	if !AppToolsAllowed(ctx) && m.isAppOnlyTool(state.ExecutionConfig.ID, toolName) {
 		return nil, nil, nil, fmt.Errorf("tool '%s' is not permitted (it is only callable from an MCP App)", toolName)
 	}
 	// NeedsReauth is the one hard gate left besides Disabled: the credential

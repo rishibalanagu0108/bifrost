@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	bifrost "github.com/maximhq/bifrost/core"
+	coremcp "github.com/maximhq/bifrost/core/mcp"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
@@ -91,8 +93,11 @@ type MCPServerHandler struct {
 	// context, so nothing about it is per caller. Its tools are replaced in place on a registry change.
 	mcpServer *server.MCPServer
 	// transport speaks the Streamable HTTP rules of every protocol revision on top of mcpServer.
-	transport *server.StreamableHTTPServer
-	served    MCPResourcesAndPromptsServer // nil serves tools only
+	transport   *server.StreamableHTTPServer
+	served      MCPResourcesAndPromptsServer // nil serves tools only
+	syncMu      sync.Mutex                   // one sync at a time, so tools, appTools and resources stay in step
+	appTools    atomic.Pointer[gatewayAppTools]
+	uiResources atomic.Bool // the server installed namespaced ui:// resources or templates
 	// tokenValidator, when set, may refuse a verified Bifrost-issued token.
 	tokenValidator MCPTokenValidator
 }
@@ -342,8 +347,13 @@ func runMCPStreamCompleter(completerSlot *atomic.Value) []schemas.PluginLogEntry
 // of MCP clients or their tools changes; the server tells listening clients the list changed. Every
 // caller is served from this one server; what each of them sees is decided per request.
 func (h *MCPServerHandler) SyncMCPServer(ctx context.Context) error {
-	availableTools := h.toolManager.GetAvailableMCPTools(ctx)
-	h.mcpServer.SetTools(h.serverTools(availableTools)...)
+	h.syncMu.Lock()
+	defer h.syncMu.Unlock()
+	// App-only tools are installed too; who may see and call them is decided per request.
+	availableTools := h.toolManager.GetAvailableMCPTools(coremcp.WithAllTools(ctx))
+	tools, apps := h.serverTools(availableTools)
+	h.appTools.Store(apps)
+	h.mcpServer.SetTools(tools...)
 	logger.Debug("Synced MCP server with %d tools", len(availableTools))
 	if h.served != nil {
 		h.syncResourcesAndPrompts(ctx)
@@ -398,6 +408,8 @@ func (h *MCPServerHandler) buildServer() *server.MCPServer {
 		server.WithToolCapabilities(true),
 	}
 	if h.served != nil {
+		// MCP Apps needs resources/read to fetch the ui:// resources.
+		options = append(options, server.WithExtensions(mcpAppsServerExtension))
 		options = append(options, h.resourcesAndPromptsOptions(hooks)...)
 	}
 	return server.NewMCPServer(mcpServerName, version, append(options, server.WithHooks(hooks))...)
@@ -406,8 +418,10 @@ func (h *MCPServerHandler) buildServer() *server.MCPServer {
 // serverTools turns every available tool into a server tool. A tool's handler reads nothing about
 // the caller: what a request may see and call rides on its context, and both the tool filter and
 // the executor read it from there.
-func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) []server.ServerTool {
+// It also returns what it learned about MCP Apps tools, nil when there are none.
+func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]server.ServerTool, *gatewayAppTools) {
 	tools := make([]server.ServerTool, 0, len(availableTools))
+	var apps *gatewayAppTools
 	for _, tool := range availableTools {
 		// Only process function tools (skip custom tools)
 		if tool.Function == nil {
@@ -479,9 +493,12 @@ func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) []serv
 		if tool.MCP != nil {
 			serverTool.Title, serverTool.Icons, serverTool.RawOutputSchema = tool.MCP.Title, tool.MCP.Icons, tool.MCP.OutputSchema
 		}
+		var aggregateMeta *mcp.Meta
+		serverTool.Meta, aggregateMeta = toolMeta(tool)
+		apps = withAppTools(apps, tool, aggregateMeta)
 		tools = append(tools, server.ServerTool{Tool: serverTool, Handler: handler})
 	}
-	return tools
+	return tools, apps
 }
 
 // gatewayToolResult is what /mcp answers for a tool message: the upstream's own result while no plugin
@@ -573,18 +590,23 @@ func derefOr(value *string, fallback string) string {
 
 // narrowListedTools narrows a tools/list answer to what the request's context permits: the include
 // lists the caller sent (x-bf-mcp-include-clients, x-bf-mcp-include-tools) and the tool list the
-// request was admitted with, which admit stamps on the same key. A no-op when the context carries
-// neither. It edits the page mcp-go built, so the server must not paginate tools/list.
+// request was admitted with, which admit stamps on the same key; then the MCP Apps rules
+// (applyAppTools). It edits the page mcp-go built, so the server must not paginate tools/list.
 func (h *MCPServerHandler) narrowListedTools(ctx context.Context, _ any, _ *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
-	if result == nil || !requestNarrowed(ctx) {
+	apps := h.appTools.Load()
+	if result == nil || (apps == nil && !requestNarrowed(ctx)) {
 		return
 	}
-	result.Tools = keepAllowed(result.Tools, func(t mcp.Tool) string { return t.Name }, h.toolManager.GetAvailableMCPTools(ctx), func(t schemas.ChatTool) string {
-		if t.Function == nil {
-			return ""
-		}
-		return t.Function.Name
-	})
+	callerCtx := withCallerCapabilities(ctx)
+	if requestNarrowed(ctx) {
+		result.Tools = keepAllowed(result.Tools, func(t mcp.Tool) string { return t.Name }, h.toolManager.GetAvailableMCPTools(callerCtx), func(t schemas.ChatTool) string {
+			if t.Function == nil {
+				return ""
+			}
+			return t.Function.Name
+		})
+	}
+	applyAppTools(callerCtx, apps, result)
 }
 
 // Admission
@@ -689,6 +711,7 @@ func (h *MCPServerHandler) admitBySlug(bifrostCtx *schemas.BifrostContext, slug 
 	if h.admitter == nil {
 		if _, clientName, found := h.config.GetMCPClientBySlug(slug); found {
 			bifrostCtx.SetValue(schemas.MCPContextKeyIncludeTools, []string{clientName + "-*"})
+			bifrostCtx.SetValue(schemas.BifrostContextKeyMCPGatewayClient, clientName)
 			return nil
 		}
 		return &mcpRefusal{status: fasthttp.StatusForbidden, message: "access_denied"}
@@ -700,6 +723,9 @@ func (h *MCPServerHandler) admitBySlug(bifrostCtx *schemas.BifrostContext, slug 
 	}
 	if served, ok := h.admitter.MCPClientToolAccess(bifrostCtx, slug, access); ok {
 		bifrostCtx.SetValue(schemas.MCPContextKeyIncludeTools, served)
+		if _, clientName, found := h.config.GetMCPClientBySlug(slug); found {
+			bifrostCtx.SetValue(schemas.BifrostContextKeyMCPGatewayClient, clientName)
+		}
 		return nil
 	}
 	// The wire answer stays 403 either way so slugs can't be probed; the log says which it was.
